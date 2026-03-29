@@ -11,6 +11,13 @@ import { useLanguage } from "@/contexts/LanguageContext";
 import { useAuth } from "@/contexts/AuthContext";
 import AuthModal from "@/components/AuthModal";
 
+interface PredictionEntry {
+  disease_name: string;
+  plant: string;
+  confidence: number;
+  severity: string;
+}
+
 interface DetectionData {
   disease_name: string;
   plant: string;
@@ -21,6 +28,10 @@ interface DetectionData {
   organic_remedy: string[];
   precautions: string[];
   fertilizer_suggestions: string[];
+  confidence_level: string;
+  warning?: string;
+  is_valid_leaf: boolean;
+  top_predictions: PredictionEntry[];
 }
 
 export default function DetectPage() {

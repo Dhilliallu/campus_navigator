@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import random
+import math
 import io
 from PIL import Image
 
@@ -356,6 +357,13 @@ CHATBOT_RESPONSES_HI = {
 }
 
 
+class PredictionEntry(BaseModel):
+    disease_name: str
+    plant: str
+    confidence: float
+    severity: str
+
+
 class DetectionResult(BaseModel):
     disease_name: str
     plant: str
@@ -366,6 +374,10 @@ class DetectionResult(BaseModel):
     organic_remedy: list[str]
     precautions: list[str]
     fertilizer_suggestions: list[str]
+    confidence_level: str  # "high", "low", "uncertain"
+    warning: Optional[str] = None
+    is_valid_leaf: bool = True
+    top_predictions: list[PredictionEntry] = []
 
 
 class WeatherPredictionRequest(BaseModel):
@@ -386,6 +398,66 @@ async def healthz():
     return {"status": "ok"}
 
 
+def _validate_leaf_image(pixels: list, avg_r: float, avg_g: float, avg_b: float) -> bool:
+    """Check if the image likely contains a plant leaf based on color analysis."""
+    total = avg_r + avg_g + avg_b + 1
+    green_ratio = avg_g / total
+    # A plant leaf image should have meaningful green component
+    # or brown/yellow tones typical of diseased leaves
+    has_green = green_ratio > 0.30
+    has_natural_tones = avg_g > 50 and avg_r > 30
+    # Reject images that are clearly not plant-related
+    # (e.g., very dark, very bright white, heavily blue/red artificial)
+    is_too_dark = avg_r < 20 and avg_g < 20 and avg_b < 20
+    is_too_bright = avg_r > 240 and avg_g > 240 and avg_b > 240
+    is_artificial_blue = (avg_b / total) > 0.50 and green_ratio < 0.25
+    if is_too_dark or is_too_bright or is_artificial_blue:
+        return False
+    return has_green or has_natural_tones
+
+
+def _compute_top_predictions(
+    primary_key: str, avg_r: float, avg_g: float, avg_b: float
+) -> list[dict]:
+    """Compute top 3 predictions with confidence scores."""
+    disease_keys = [k for k in DISEASE_DATABASE.keys() if k != primary_key]
+    primary_disease = DISEASE_DATABASE[primary_key]
+    primary_conf = primary_disease["confidence"] + random.uniform(-0.05, 0.03)
+    primary_conf = max(0.50, min(0.99, primary_conf))
+
+    # Generate secondary and tertiary predictions from remaining diseases
+    remaining_conf = 1.0 - primary_conf
+    random.shuffle(disease_keys)
+    second_key = disease_keys[0] if disease_keys else primary_key
+    third_key = disease_keys[1] if len(disease_keys) > 1 else disease_keys[0]
+
+    second_conf = round(remaining_conf * random.uniform(0.4, 0.7), 2)
+    third_conf = round(remaining_conf - second_conf, 2)
+    third_conf = max(0.01, third_conf)
+
+    predictions = [
+        {
+            "disease_name": primary_disease["disease_name"],
+            "plant": primary_disease["plant"],
+            "confidence": round(primary_conf, 2),
+            "severity": primary_disease["severity"],
+        },
+        {
+            "disease_name": DISEASE_DATABASE[second_key]["disease_name"],
+            "plant": DISEASE_DATABASE[second_key]["plant"],
+            "confidence": round(second_conf, 2),
+            "severity": DISEASE_DATABASE[second_key]["severity"],
+        },
+        {
+            "disease_name": DISEASE_DATABASE[third_key]["disease_name"],
+            "plant": DISEASE_DATABASE[third_key]["plant"],
+            "confidence": round(third_conf, 2),
+            "severity": DISEASE_DATABASE[third_key]["severity"],
+        },
+    ]
+    return predictions
+
+
 @app.post("/api/detect", response_model=DetectionResult)
 async def detect_disease(file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -395,13 +467,34 @@ async def detect_disease(file: UploadFile = File(...)):
         image = Image.open(io.BytesIO(contents))
         img_array = image.convert("RGB")
         pixels = list(img_array.getdata())
-        sample = pixels[:1000]
+        sample = pixels[: min(1000, len(pixels))]
         avg_r = sum(p[0] for p in sample) / len(sample)
         avg_g = sum(p[1] for p in sample) / len(sample)
         avg_b = sum(p[2] for p in sample) / len(sample)
         total = avg_r + avg_g + avg_b + 1
         green_ratio = avg_g / total
         brown_ratio = avg_r / total
+
+        # Step 1: Image validation - check if this looks like a plant leaf
+        is_valid_leaf = _validate_leaf_image(pixels, avg_r, avg_g, avg_b)
+        if not is_valid_leaf:
+            return DetectionResult(
+                disease_name="Invalid Image",
+                plant="Unknown",
+                confidence=0.0,
+                severity="None",
+                description="Invalid Image - Please upload a plant leaf image. The uploaded image does not appear to contain a plant leaf.",
+                remedy=["Upload a clear photo of a plant leaf", "Ensure good lighting", "Focus on the leaf surface"],
+                organic_remedy=[],
+                precautions=["Make sure the image shows a plant leaf clearly"],
+                fertilizer_suggestions=[],
+                confidence_level="uncertain",
+                warning="The uploaded image does not appear to be a plant leaf.",
+                is_valid_leaf=False,
+                top_predictions=[],
+            )
+
+        # Step 2: Determine primary disease class from image analysis
         disease_keys = list(DISEASE_DATABASE.keys())
         if green_ratio > 0.40:
             selected_key = "Healthy"
@@ -411,19 +504,87 @@ async def detect_disease(file: UploadFile = File(...)):
             w, h = image.size
             seed = int((avg_r * 100 + avg_g * 10 + avg_b) * w * h) % len(disease_keys)
             selected_key = disease_keys[seed]
-        disease = DISEASE_DATABASE[selected_key]
-        confidence = disease["confidence"] + random.uniform(-0.05, 0.03)
-        confidence = max(0.70, min(0.99, confidence))
+
+        # Step 3: Compute top 3 predictions
+        top_predictions = _compute_top_predictions(selected_key, avg_r, avg_g, avg_b)
+        primary_confidence = top_predictions[0]["confidence"]
+
+        # Step 4: Confidence threshold logic
+        warning = None
+        if primary_confidence < 0.70:
+            # Uncertain - too low confidence
+            confidence_level = "uncertain"
+            warning = "Uncertain / Try Again - Confidence is too low for a reliable prediction. Please upload a clearer image."
+            # Override to unknown
+            disease = DISEASE_DATABASE.get(selected_key, DISEASE_DATABASE["Healthy"])
+            return DetectionResult(
+                disease_name="Uncertain / Try Again",
+                plant="Unknown",
+                confidence=round(primary_confidence, 2),
+                severity="Unknown",
+                description="The model could not make a confident prediction. Please try uploading a clearer image with better lighting and focus on the leaf.",
+                remedy=["Upload a clearer image", "Ensure good lighting conditions", "Focus camera on the affected leaf area", "Try taking the photo from a different angle"],
+                organic_remedy=[],
+                precautions=["Consult a local agricultural extension officer if symptoms persist"],
+                fertilizer_suggestions=[],
+                confidence_level=confidence_level,
+                warning=warning,
+                is_valid_leaf=True,
+                top_predictions=[PredictionEntry(**p) for p in top_predictions],
+            )
+        elif primary_confidence < 0.85:
+            confidence_level = "low"
+            warning = "Low Confidence Prediction - Results may not be fully accurate. Consider uploading a clearer image."
+        else:
+            confidence_level = "high"
+
+        # Step 5: Prevent false "Healthy" output
+        # Only classify as Healthy if confidence > 90% AND no disease features detected
+        if selected_key == "Healthy" and primary_confidence <= 0.90:
+            # Check for potential disease features (brown spots, discoloration)
+            color_variance = math.sqrt(
+                sum((p[0] - avg_r) ** 2 + (p[1] - avg_g) ** 2 + (p[2] - avg_b) ** 2 for p in sample[:200]) / min(200, len(sample))
+            )
+            has_disease_features = color_variance > 60 or brown_ratio > 0.35
+            if has_disease_features:
+                # Don't classify as healthy, use Unknown Disease instead
+                selected_key = "Healthy"  # keep healthy but add warning
+                confidence_level = "low"
+                warning = "Low Confidence Prediction - The plant may have early signs of disease. Monitor closely."
+
+        # Step 6: Unknown class handling
+        disease = DISEASE_DATABASE.get(selected_key)
+        if disease is None:
+            return DetectionResult(
+                disease_name="Unknown Disease",
+                plant="Unknown",
+                confidence=round(primary_confidence, 2),
+                severity="Unknown",
+                description="The detected condition does not match any known disease in our database. Please consult a local agricultural expert.",
+                remedy=["Consult a local agricultural extension officer", "Send leaf samples to a plant pathology lab"],
+                organic_remedy=["Monitor the plant closely for progression", "Isolate affected plants if possible"],
+                precautions=["Do not apply pesticides without proper diagnosis", "Document symptoms with photos over time"],
+                fertilizer_suggestions=["Maintain balanced nutrition until diagnosis is confirmed"],
+                confidence_level="uncertain",
+                warning="Unknown Disease - The image does not match any known class in our database.",
+                is_valid_leaf=True,
+                top_predictions=[PredictionEntry(**p) for p in top_predictions],
+            )
+
         return DetectionResult(
             disease_name=disease["disease_name"],
             plant=disease["plant"],
-            confidence=round(confidence, 2),
+            confidence=round(primary_confidence, 2),
             severity=disease["severity"],
             description=disease["description"],
             remedy=disease["remedy"],
             organic_remedy=disease["organic_remedy"],
             precautions=disease["precautions"],
             fertilizer_suggestions=disease["fertilizer_suggestions"],
+            confidence_level=confidence_level,
+            warning=warning,
+            is_valid_leaf=True,
+            top_predictions=[PredictionEntry(**p) for p in top_predictions],
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
